@@ -1,0 +1,305 @@
+import base64
+import os
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+
+import requests
+from dotenv import load_dotenv
+from flask import Flask, jsonify, redirect, request, session
+from flask_cors import CORS
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from google.generativeai import GenerativeModel, configure
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from bson import ObjectId
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.getenv("SESSION_SECRET", "change-this-secret"),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+CORS(app, origins=[os.getenv("FRONTEND_URL", "http://localhost:5173")], supports_credentials=True)
+
+mongo_client = MongoClient(os.environ["MONGO_URI"])
+database = mongo_client[os.getenv("MONGO_DB_NAME", "ai-assignment-organizer")]
+users = database.users
+assignments = database.assignments
+assignments.create_index([("gmailId", ASCENDING)], unique=True, sparse=True)
+assignments.create_index([("userId", ASCENDING), ("createdAt", DESCENDING)])
+
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_SCOPES = [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
+
+if os.getenv("GEMINI_API_KEY"):
+    configure(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def serialize(document):
+    """Convert MongoDB values into JSON-compatible values."""
+    result = dict(document)
+    if "_id" in result:
+        result["_id"] = str(result["_id"])
+    for key, value in result.items():
+        if isinstance(value, ObjectId):
+            result[key] = str(value)
+        elif isinstance(value, datetime):
+            result[key] = value.isoformat()
+    return result
+
+
+def current_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    return users.find_one({"_id": ObjectId(user_id)})
+
+
+def authenticated(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user = current_user()
+        if user is None:
+            return jsonify(error="Not authenticated"), 401
+        return view(user, *args, **kwargs)
+
+    return wrapped
+
+
+def google_client_config():
+    return {
+        "client_id": os.environ["GMAIL_CLIENT_ID"],
+        "client_secret": os.environ["GMAIL_CLIENT_SECRET"],
+        "redirect_uri": os.environ["GMAIL_REDIRECT_URI"],
+    }
+
+
+@app.get("/api/auth/google")
+def google_login():
+    config = google_client_config()
+    session["oauth_state"] = os.urandom(24).hex()
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": config["redirect_uri"],
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": session["oauth_state"],
+    }
+    query = requests.Request("GET", GOOGLE_AUTH_URL, params=params).prepare().url
+    return redirect(query)
+
+
+@app.get("/api/auth/google/callback")
+def google_callback():
+    if request.args.get("state") != session.pop("oauth_state", None):
+        return jsonify(error="Invalid OAuth state"), 400
+
+    config = google_client_config()
+    token_response = requests.post(
+        GOOGLE_TOKEN_URL,
+        data={
+            "code": request.args["code"],
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+            "redirect_uri": config["redirect_uri"],
+            "grant_type": "authorization_code",
+        },
+        timeout=30,
+    )
+    token_response.raise_for_status()
+    token_data = token_response.json()
+
+    userinfo = requests.get(
+        "https://openidconnect.googleapis.com/v1/userinfo",
+        headers={"Authorization": f"Bearer {token_data['access_token']}"},
+        timeout=30,
+    )
+    userinfo.raise_for_status()
+    profile = userinfo.json()
+    now = datetime.now(timezone.utc)
+    user = users.find_one_and_update(
+        {"googleId": profile["sub"]},
+        {
+            "$set": {
+                "email": profile["email"],
+                "name": profile.get("name", ""),
+                "accessToken": token_data["access_token"],
+                "refreshToken": token_data.get("refresh_token"),
+                "tokenExpiry": now + timedelta(seconds=token_data.get("expires_in", 3600)),
+                "updatedAt": now,
+            },
+            "$setOnInsert": {"createdAt": now},
+        },
+        upsert=True,
+        return_document=True,
+    )
+    session["user_id"] = str(user["_id"])
+    return redirect(os.getenv("FRONTEND_URL", "http://localhost:5173"))
+
+
+@app.get("/api/auth/logout")
+def logout():
+    session.clear()
+    return redirect(os.getenv("FRONTEND_URL", "http://localhost:5173"))
+
+
+@app.get("/api/auth/user")
+def get_user():
+    user = current_user()
+    if user is None:
+        return jsonify(error="Not authenticated"), 401
+    return jsonify(user=serialize(user))
+
+
+@app.post("/api/assignments")
+@authenticated
+def create_assignment(user):
+    data = request.get_json(silent=True) or {}
+    data["userId"] = user["_id"]
+    data.setdefault("progress", 0)
+    now = datetime.now(timezone.utc)
+    data.update(createdAt=now, updatedAt=now)
+    result = assignments.insert_one(data)
+    data["_id"] = result.inserted_id
+    return jsonify(serialize(data)), 201
+
+
+@app.get("/api/assignments")
+@authenticated
+def get_assignments(user):
+    records = assignments.find({"userId": user["_id"]})
+    return jsonify([serialize(record) for record in records])
+
+
+@app.get("/api/assignments/<assignment_id>")
+@authenticated
+def get_assignment(user, assignment_id):
+    record = assignments.find_one({"_id": ObjectId(assignment_id), "userId": user["_id"]})
+    if record is None:
+        return jsonify(error="Assignment not found"), 404
+    return jsonify(serialize(record))
+
+
+@app.put("/api/assignments/<assignment_id>")
+@authenticated
+def update_assignment(user, assignment_id):
+    data = request.get_json(silent=True) or {}
+    data.pop("_id", None)
+    data.pop("userId", None)
+    data["updatedAt"] = datetime.now(timezone.utc)
+    result = assignments.find_one_and_update(
+        {"_id": ObjectId(assignment_id), "userId": user["_id"]},
+        {"$set": data},
+        return_document=True,
+    )
+    if result is None:
+        return jsonify(error="Assignment not found"), 404
+    return jsonify(serialize(result))
+
+
+@app.delete("/api/assignments/<assignment_id>")
+@authenticated
+def delete_assignment(user, assignment_id):
+    result = assignments.delete_one({"_id": ObjectId(assignment_id), "userId": user["_id"]})
+    if result.deleted_count == 0:
+        return jsonify(error="Assignment not found"), 404
+    return jsonify(message="Assignment deleted")
+
+
+def analyze_assignment(description):
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    model = GenerativeModel("gemini-1.5-flash")
+    prompt = f"""
+Analyze this assignment and return JSON with category, difficulty, estimatedHours,
+priority, and requiredSteps. Assignment: {description}
+"""
+    response = model.generate_content(prompt)
+    text = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+    import json
+    return json.loads(text)
+
+
+@app.post("/api/ai/analyze")
+@authenticated
+def analyze(user):
+    try:
+        return jsonify(analyze_assignment((request.get_json(silent=True) or {}).get("description", "")))
+    except Exception as error:
+        return jsonify(error=str(error)), 500
+
+
+@app.post("/api/ai/plan")
+@authenticated
+def plan(user):
+    data = request.get_json(silent=True) or {}
+    result = [
+        {
+            "assignmentId": assignment.get("_id"),
+            "dailyPlan": f"Work on {assignment.get('title', '')} for {assignment.get('estimatedHours', 0)} hours.",
+        }
+        for assignment in data.get("assignments", [])
+    ]
+    return jsonify(result)
+
+
+def message_body(payload):
+    parts = payload.get("parts", [])
+    for part in parts:
+        if part.get("mimeType") in {"text/plain", "text/html"} and part.get("body", {}).get("data"):
+            return base64.urlsafe_b64decode(part["body"]["data"] + "===").decode("utf-8", errors="replace")
+    data = payload.get("body", {}).get("data")
+    return base64.urlsafe_b64decode(data + "===").decode("utf-8", errors="replace") if data else ""
+
+
+@app.get("/api/gmail/fetch")
+@authenticated
+def fetch_gmail(user):
+    try:
+        credentials = Credentials(
+            token=user.get("accessToken"),
+            refresh_token=user.get("refreshToken"),
+            token_uri=GOOGLE_TOKEN_URL,
+            client_id=os.environ["GMAIL_CLIENT_ID"],
+            client_secret=os.environ["GMAIL_CLIENT_SECRET"],
+        )
+        gmail = build("gmail", "v1", credentials=credentials)
+        response = gmail.users().messages().list(
+            userId="me",
+            q="from:no-reply@classroom.google.com OR (classroom.google.com AND (assignment OR posted OR due))",
+            maxResults=50,
+        ).execute()
+        new_count = 0
+        for item in response.get("messages", []):
+            message = gmail.users().messages().get(userId="me", id=item["id"], format="full").execute()
+            headers = {header["name"].lower(): header.get("value", "") for header in message.get("payload", {}).get("headers", [])}
+            subject = headers.get("subject", "")
+            description = message.get("snippet", "") or message_body(message.get("payload", {}))
+            if not any(word in f"{subject} {description}".lower() for word in ("assignment", "posted", "due")):
+                continue
+            has_pdf = any(part.get("filename", "").lower().endswith(".pdf") for part in message.get("payload", {}).get("parts", []))
+            document = {
+                "gmailId": item["id"], "title": subject, "description": description,
+                "source": "google_classroom", "hasPdf": has_pdf, "userId": user["_id"],
+                "createdAt": datetime.now(timezone.utc), "updatedAt": datetime.now(timezone.utc),
+            }
+            result = assignments.update_one({"gmailId": item["id"]}, {"$setOnInsert": document}, upsert=True)
+            new_count += int(result.upserted_id is not None)
+        records = assignments.find({"userId": user["_id"]}).sort("createdAt", DESCENDING)
+        return jsonify(message=f"{new_count} new assignments fetched", assignments=[serialize(record) for record in records])
+    except Exception as error:
+        return jsonify(error=str(error)), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")
